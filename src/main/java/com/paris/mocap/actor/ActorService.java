@@ -16,6 +16,8 @@ import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.scoreboard.Scoreboard;
+import org.bukkit.scoreboard.Team;
 
 public final class ActorService implements AutoCloseable {
     private final JavaPlugin plugin;
@@ -61,6 +63,7 @@ public final class ActorService implements AutoCloseable {
         actor.setVisibilityMode(visibility);
         actor.setSkinParts(track.skinParts());
         actor.setEntityReach(track.entityReach());
+        bindNametagTeam(actor);
         this.actors.put(actor.entityId(), actor);
         return actor;
     }
@@ -94,6 +97,7 @@ public final class ActorService implements AutoCloseable {
             return;
         }
         this.actors.remove(actor.entityId());
+        unbindNametagTeam(actor);
         for (Player viewer : this.packets.resolveViewers(actor)) {
             this.packets.despawnFor(actor, viewer);
         }
@@ -124,6 +128,40 @@ public final class ActorService implements AutoCloseable {
 
     public void syncEquipment(PacketActor actor) {
         this.packets.equipment(actor, this.packets.resolveViewers(actor));
+    }
+
+    private void bindNametagTeam(PacketActor actor) {
+        Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
+        Team team = board.getTeam(actor.teamName());
+        if (team == null) {
+            team = board.registerNewTeam(actor.teamName());
+        }
+        team.setOption(
+            Team.Option.NAME_TAG_VISIBILITY,
+            actor.nametagHidden() ? Team.OptionStatus.NEVER : Team.OptionStatus.ALWAYS
+        );
+        team.setOption(Team.Option.COLLISION_RULE, Team.OptionStatus.NEVER);
+        try {
+            team.displayName(net.kyori.adventure.text.Component.text(actor.name()));
+            team.prefix(net.kyori.adventure.text.Component.empty());
+            team.suffix(net.kyori.adventure.text.Component.empty());
+        } catch (Throwable ignored) {
+        }
+        if (!team.hasEntry(actor.profileName())) {
+            team.addEntry(actor.profileName());
+        }
+    }
+
+    private void unbindNametagTeam(PacketActor actor) {
+        Scoreboard board = Bukkit.getScoreboardManager().getMainScoreboard();
+        Team team = board.getTeam(actor.teamName());
+        if (team == null) {
+            return;
+        }
+        try {
+            team.unregister();
+        } catch (IllegalStateException ignored) {
+        }
     }
 
     private void refreshViewers() {

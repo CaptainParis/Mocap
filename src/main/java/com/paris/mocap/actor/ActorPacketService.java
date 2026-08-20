@@ -13,11 +13,14 @@ import com.comphenix.protocol.wrappers.WrappedDataValue;
 import com.comphenix.protocol.wrappers.WrappedDataWatcher;
 import com.comphenix.protocol.wrappers.WrappedGameProfile;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.logging.Level;
@@ -35,8 +38,17 @@ public final class ActorPacketService {
     private final PacketType positionSyncType;
     private final WrappedDataWatcher.Serializer cachedByteSerializer;
     private final WrappedDataWatcher.Serializer cachedPoseSerializer;
+    private final WrappedDataWatcher.Serializer cachedOptionalComponentSerializer;
+    private final WrappedDataWatcher.Serializer cachedBooleanSerializer;
     private final int skinPartsIndex;
+    private final int livingFlagsIndex;
+    private final Class<?> pmrClass;
+    private final Constructor<?> vec3Ctor;
+    private final Constructor<?> pmrCtor;
+    private final Constructor<?> positionSyncCtor;
     private boolean warnedLegacyTeleport;
+    private boolean warnedSwing;
+    private boolean warnedAction;
 
     public ActorPacketService(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -44,7 +56,20 @@ public final class ActorPacketService {
         this.positionSyncType = resolvePacketType("ENTITY_POSITION_SYNC");
         this.cachedByteSerializer = resolveByteSerializer();
         this.cachedPoseSerializer = resolvePoseSerializer();
+        this.cachedOptionalComponentSerializer = resolveOptionalComponentSerializer();
+        this.cachedBooleanSerializer = resolveBooleanSerializer();
         this.skinPartsIndex = resolveSkinPartsIndex();
+        this.livingFlagsIndex = resolveLivingFlagsIndex();
+        Class<?> vec3Class = resolveClass("net.minecraft.world.phys.Vec3", "net.minecraft.world.phys.Vec3D");
+        this.pmrClass = resolveClass("net.minecraft.world.entity.PositionMoveRotation");
+        this.vec3Ctor = constructor(vec3Class, double.class, double.class, double.class);
+        this.pmrCtor = constructor(this.pmrClass, vec3Class, vec3Class, float.class, float.class);
+        this.positionSyncCtor = constructor(
+            resolveClass("net.minecraft.network.protocol.game.ClientboundEntityPositionSyncPacket"),
+            int.class,
+            this.pmrClass,
+            boolean.class
+        );
     }
 
     public void spawnFor(PacketActor actor, Player viewer) {
@@ -109,10 +134,18 @@ public final class ActorPacketService {
     }
 
     public void swing(PacketActor actor, boolean offHand, Iterable<Player> viewers) {
+        int animation = offHand ? 3 : 0;
         PacketContainer packet = this.protocol.createPacket(PacketType.Play.Server.ANIMATION);
-        packet.getIntegers().write(0, actor.entityId());
-        packet.getIntegers().write(1, offHand ? 3 : 0);
-        broadcast(packet, viewers);
+        boolean wrote = writeAnimation(packet, actor.entityId(), animation);
+        if (!wrote && !this.warnedSwing) {
+            this.warnedSwing = true;
+            this.plugin.getLogger().warning(
+                "Unable to write ANIMATION packet fields; actor hit/place swings will not play."
+            );
+        }
+        if (wrote) {
+            broadcast(packet, viewers);
+        }
     }
 
     public void entityStatus(PacketActor actor, byte status, Iterable<Player> viewers) {
@@ -129,7 +162,10 @@ public final class ActorPacketService {
         if (serializer == null) {
             return;
         }
-        packet.getDataValueCollectionModifier().write(0, List.of(new WrappedDataValue(8, serializer, handState)));
+        packet.getDataValueCollectionModifier().write(
+            0,
+            List.of(new WrappedDataValue(this.livingFlagsIndex, serializer, handState))
+        );
         broadcast(packet, viewers);
     }
 
@@ -138,19 +174,22 @@ public final class ActorPacketService {
         EnumSet<EnumWrappers.PlayerInfoAction> actions = EnumSet.of(
             EnumWrappers.PlayerInfoAction.ADD_PLAYER,
             EnumWrappers.PlayerInfoAction.UPDATE_LISTED,
-            EnumWrappers.PlayerInfoAction.UPDATE_DISPLAY_NAME
+            EnumWrappers.PlayerInfoAction.UPDATE_DISPLAY_NAME,
+            EnumWrappers.PlayerInfoAction.UPDATE_GAME_MODE,
+            EnumWrappers.PlayerInfoAction.UPDATE_LATENCY
         );
         packet.getPlayerInfoActions().write(0, actions);
 
         WrappedGameProfile profile = profileOf(actor);
+        WrappedChatComponent nametag = WrappedChatComponent.fromText(trimName(actor.name()));
 
         PlayerInfoData data = new PlayerInfoData(
             actor.uniqueId(),
             Math.min(4095, actor.pingMs()),
-            true,
+            false,
             EnumWrappers.NativeGameMode.SURVIVAL,
             profile,
-            WrappedChatComponent.fromText(trimName(actor.name()))
+            nametag
         );
 
         try {
@@ -176,25 +215,10 @@ public final class ActorPacketService {
         packet.getDoubles().write(0, (double) pose.x());
         packet.getDoubles().write(1, (double) pose.y());
         packet.getDoubles().write(2, (double) pose.z());
-
-        byte yaw = toAngle(pose.yaw());
-        byte pitch = toAngle(pose.pitch());
-        try {
-            packet.getBytes().write(0, pitch);
-            packet.getBytes().write(1, yaw);
-        } catch (Exception ex) {
-            try {
-                packet.getBytes().write(0, yaw);
-                packet.getBytes().write(1, pitch);
-            } catch (Exception ignored) {
-            }
-        }
+        writeSpawnRotation(packet, pose.yaw(), pose.pitch());
         send(viewer, packet);
-
-        PacketContainer head = this.protocol.createPacket(PacketType.Play.Server.ENTITY_HEAD_ROTATION);
-        head.getIntegers().write(0, actor.entityId());
-        head.getBytes().write(0, yaw);
-        send(viewer, head);
+        sendLook(actor, viewer, pose);
+        sendHeadRotation(actor, viewer, pose.yaw());
     }
 
     private void sendTeleport(PacketActor actor, Player viewer) {
@@ -203,21 +227,38 @@ public final class ActorPacketService {
             ? this.positionSyncType
             : PacketType.Play.Server.ENTITY_TELEPORT;
 
+        PacketContainer packet = createPositionPacket(type, actor.entityId(), pose);
+        if (packet != null) {
+            send(viewer, packet);
+        }
+        sendLook(actor, viewer, pose);
+        sendHeadRotation(actor, viewer, pose.yaw());
+    }
+
+    private PacketContainer createPositionPacket(PacketType type, int entityId, Pose pose) {
+        Object pmr = newPositionMoveRotation(pose);
+        if (pmr != null && this.positionSyncCtor != null && type == this.positionSyncType) {
+            try {
+                Object handle = this.positionSyncCtor.newInstance(entityId, pmr, true);
+                return new PacketContainer(type, handle);
+            } catch (Exception ex) {
+                this.plugin.getLogger().log(Level.FINE, "Could not construct ENTITY_POSITION_SYNC", ex);
+            }
+        }
+
         PacketContainer packet = this.protocol.createPacket(type);
-        packet.getIntegers().write(0, actor.entityId());
-
-        boolean wroteModern = writePositionMoveRotation(packet, pose);
+        packet.getIntegers().write(0, entityId);
+        boolean wroteModern = writePositionMoveRotation(packet, pose, pmr);
         if (!wroteModern) {
-
             if (hasPositionMoveRotationStructure(packet)) {
                 if (!this.warnedLegacyTeleport) {
                     this.warnedLegacyTeleport = true;
                     this.plugin.getLogger().warning(
-                        "Unable to write PositionMoveRotation for ENTITY_TELEPORT; actor motion may stall. "
+                        "Unable to write PositionMoveRotation; actor motion may stall. "
                             + "Update ProtocolLib if actors do not move."
                     );
                 }
-                return;
+                return null;
             }
             packet.getDoubles().write(0, (double) pose.x());
             packet.getDoubles().write(1, (double) pose.y());
@@ -237,22 +278,27 @@ public final class ActorPacketService {
         }
 
         tryWriteEmptyRelatives(packet);
-        send(viewer, packet);
-
-        PacketContainer head = this.protocol.createPacket(PacketType.Play.Server.ENTITY_HEAD_ROTATION);
-        head.getIntegers().write(0, actor.entityId());
-        head.getBytes().write(0, toAngle(pose.yaw()));
-        send(viewer, head);
+        return packet;
     }
 
-    private boolean writePositionMoveRotation(PacketContainer packet, Pose pose) {
+    private boolean writePositionMoveRotation(PacketContainer packet, Pose pose, Object pmr) {
+        if (pmr != null && this.pmrClass != null) {
+            try {
+                var modifier = packet.getModifier().withType(this.pmrClass);
+                if (modifier.size() > 0) {
+                    modifier.write(0, pmr);
+                    return true;
+                }
+            } catch (Exception ex) {
+                this.plugin.getLogger().log(Level.FINE, "PositionMoveRotation modifier write failed", ex);
+            }
+        }
         try {
             if (!hasPositionMoveRotationStructure(packet)) {
                 return false;
             }
             InternalStructure change = packet.getStructures().read(0);
             if (change.getVectors().size() < 2) {
-
                 try {
                     change.getVectors().write(0, new Vector(pose.x(), pose.y(), pose.z()));
                     change.getVectors().write(1, new Vector(0, 0, 0));
@@ -277,6 +323,111 @@ public final class ActorPacketService {
             this.plugin.getLogger().log(Level.FINE, "PositionMoveRotation write failed, trying legacy", ex);
             return false;
         }
+    }
+
+    private Object newPositionMoveRotation(Pose pose) {
+        if (this.vec3Ctor == null || this.pmrCtor == null) {
+            return null;
+        }
+        try {
+            Object pos = this.vec3Ctor.newInstance((double) pose.x(), (double) pose.y(), (double) pose.z());
+            Object vel = this.vec3Ctor.newInstance(0d, 0d, 0d);
+            return this.pmrCtor.newInstance(pos, vel, pose.yaw(), pose.pitch());
+        } catch (Exception ex) {
+            this.plugin.getLogger().log(Level.FINE, "Could not construct PositionMoveRotation", ex);
+            return null;
+        }
+    }
+
+    private void writeSpawnRotation(PacketContainer packet, float yawDeg, float pitchDeg) {
+        byte yaw = toAngle(yawDeg);
+        byte pitch = toAngle(pitchDeg);
+        try {
+            int bytes = packet.getBytes().size();
+            if (bytes >= 2) {
+                packet.getBytes().write(0, pitch);
+                packet.getBytes().write(1, yaw);
+            }
+            if (bytes >= 3) {
+                packet.getBytes().write(2, yaw);
+            }
+            if (bytes >= 2) {
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            int floats = packet.getFloat().size();
+            if (floats >= 2) {
+                packet.getFloat().write(0, pitchDeg);
+                packet.getFloat().write(1, yawDeg);
+                if (floats >= 3) {
+                    packet.getFloat().write(2, yawDeg);
+                }
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        writeHandleBytes(packet.getHandle(), pitch, yaw, yaw);
+    }
+
+    private void sendLook(PacketActor actor, Player viewer, Pose pose) {
+        try {
+            PacketContainer look = this.protocol.createPacket(PacketType.Play.Server.ENTITY_LOOK);
+            look.getIntegers().write(0, actor.entityId());
+            byte yaw = toAngle(pose.yaw());
+            byte pitch = toAngle(pose.pitch());
+            try {
+                look.getBytes().write(0, yaw);
+                look.getBytes().write(1, pitch);
+            } catch (Exception ex) {
+                writeHandleBytes(look.getHandle(), yaw, pitch);
+            }
+            try {
+                if (look.getBooleans().size() > 0) {
+                    look.getBooleans().write(0, true);
+                }
+            } catch (Exception ignored) {
+            }
+            send(viewer, look);
+        } catch (Exception ex) {
+            this.plugin.getLogger().log(Level.FINE, "ENTITY_LOOK failed", ex);
+        }
+    }
+
+    private void sendHeadRotation(PacketActor actor, Player viewer, float yawDeg) {
+        try {
+            PacketContainer head = this.protocol.createPacket(PacketType.Play.Server.ENTITY_HEAD_ROTATION);
+            try {
+                head.getIntegers().write(0, actor.entityId());
+            } catch (Exception ex) {
+                writeHandleInts(head.getHandle(), actor.entityId());
+            }
+            try {
+                head.getBytes().write(0, toAngle(yawDeg));
+            } catch (Exception ex) {
+                writeHandleBytes(head.getHandle(), toAngle(yawDeg));
+            }
+            send(viewer, head);
+        } catch (Exception ex) {
+            this.plugin.getLogger().log(Level.FINE, "ENTITY_HEAD_ROTATION failed", ex);
+        }
+    }
+
+    private boolean writeAnimation(PacketContainer packet, int entityId, int animation) {
+        try {
+            var ints = packet.getIntegers();
+            if (ints.size() >= 2) {
+                ints.write(0, entityId);
+                ints.write(1, animation);
+                return true;
+            }
+            if (ints.size() == 1) {
+                ints.write(0, entityId);
+            }
+        } catch (Exception ignored) {
+        }
+        return writeHandleInts(packet.getHandle(), entityId, animation);
     }
 
     private static boolean hasPositionMoveRotationStructure(PacketContainer packet) {
@@ -330,9 +481,31 @@ public final class ActorPacketService {
         }
 
         values.add(new WrappedDataValue(this.skinPartsIndex, byteSerializer, actor.skinParts()));
+        writeNametag(values, actor);
 
         packet.getDataValueCollectionModifier().write(0, values);
         send(viewer, packet);
+    }
+
+    private void writeNametag(List<WrappedDataValue> values, PacketActor actor) {
+        if (this.cachedOptionalComponentSerializer == null || this.cachedBooleanSerializer == null) {
+            return;
+        }
+        try {
+            WrappedChatComponent name = WrappedChatComponent.fromText(trimName(actor.name()));
+            values.add(new WrappedDataValue(
+                2,
+                this.cachedOptionalComponentSerializer,
+                Optional.of(name.getHandle())
+            ));
+            values.add(new WrappedDataValue(
+                3,
+                this.cachedBooleanSerializer,
+                !actor.nametagHidden()
+            ));
+        } catch (Exception ex) {
+            this.plugin.getLogger().log(Level.FINE, "Could not write actor nametag metadata", ex);
+        }
     }
 
     private void sendEquipment(PacketActor actor, Player viewer) {
@@ -369,7 +542,7 @@ public final class ActorPacketService {
     private WrappedGameProfile profileOf(PacketActor actor) {
         String texture = actor.skinTexture();
         String signature = actor.skinSignature() == null ? "" : actor.skinSignature();
-        String name = trimName(actor.name());
+        String name = actor.profileName();
         UUID uuid = actor.uniqueId();
 
         if (texture == null || texture.isEmpty()) {
@@ -551,7 +724,7 @@ public final class ActorPacketService {
     }
 
     private static byte toAngle(float degrees) {
-        return (byte) (degrees * 256.0F / 360.0F);
+        return (byte) Math.floor(degrees * 256.0F / 360.0F);
     }
 
     private EnumWrappers.ItemSlot mapSlot(EquipmentSlot slot) {
@@ -622,21 +795,62 @@ public final class ActorPacketService {
         }
     }
 
+    private static WrappedDataWatcher.Serializer resolveOptionalComponentSerializer() {
+        try {
+            return WrappedDataWatcher.Registry.getChatComponentSerializer(true);
+        } catch (Exception ex) {
+            try {
+                return WrappedDataWatcher.Registry.get(
+                    Class.forName("net.minecraft.network.chat.Component"),
+                    true
+                );
+            } catch (Exception ex2) {
+                return null;
+            }
+        }
+    }
+
+    private static WrappedDataWatcher.Serializer resolveBooleanSerializer() {
+        try {
+            return WrappedDataWatcher.Registry.get(Boolean.class, false);
+        } catch (Exception ex) {
+            try {
+                return WrappedDataWatcher.Registry.get(Boolean.class);
+            } catch (Exception ex2) {
+                return null;
+            }
+        }
+    }
+
+    private static int resolveLivingFlagsIndex() {
+        int index = accessorIndex(
+            new String[] {"net.minecraft.world.entity.LivingEntity"},
+            new String[] {"DATA_LIVING_ENTITY_FLAGS", "LIVING_FLAGS"}
+        );
+        return index >= 0 ? index : 8;
+    }
+
     private static int resolveSkinPartsIndex() {
-        String[] classes = {
-            "net.minecraft.world.entity.Avatar",
-            "net.minecraft.world.entity.player.Player"
-        };
-        String[] fields = {
-            "DATA_PLAYER_MODE_CUSTOMISATION",
-            "PLAYER_MODE_CUSTOMIZATION_ID"
-        };
+        int index = accessorIndex(
+            new String[] {
+                "net.minecraft.world.entity.Avatar",
+                "net.minecraft.world.entity.player.Player"
+            },
+            new String[] {
+                "DATA_PLAYER_MODE_CUSTOMISATION",
+                "PLAYER_MODE_CUSTOMIZATION_ID"
+            }
+        );
+        return index >= 0 ? index : 16;
+    }
+
+    private static int accessorIndex(String[] classes, String[] fields) {
         for (String className : classes) {
             try {
                 Class<?> type = Class.forName(className);
                 for (String fieldName : fields) {
                     try {
-                        java.lang.reflect.Field field = type.getDeclaredField(fieldName);
+                        Field field = type.getDeclaredField(fieldName);
                         field.setAccessible(true);
                         Object accessor = field.get(null);
                         if (accessor == null) {
@@ -646,8 +860,8 @@ public final class ActorPacketService {
                             try {
                                 Method method = accessor.getClass().getMethod(methodName);
                                 Object value = method.invoke(accessor);
-                                if (value instanceof Integer index && index >= 0 && index < 64) {
-                                    return index;
+                                if (value instanceof Integer resolved && resolved >= 0 && resolved < 64) {
+                                    return resolved;
                                 }
                             } catch (ReflectiveOperationException ignored) {
                             }
@@ -658,7 +872,76 @@ public final class ActorPacketService {
             } catch (ClassNotFoundException ignored) {
             }
         }
-        return 16;
+        return -1;
+    }
+
+    private static Class<?> resolveClass(String... names) {
+        for (String name : names) {
+            if (name == null) {
+                continue;
+            }
+            try {
+                return Class.forName(name);
+            } catch (ClassNotFoundException ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static Constructor<?> constructor(Class<?> type, Class<?>... params) {
+        if (type == null) {
+            return null;
+        }
+        for (Class<?> param : params) {
+            if (param == null) {
+                return null;
+            }
+        }
+        try {
+            Constructor<?> ctor = type.getDeclaredConstructor(params);
+            ctor.setAccessible(true);
+            return ctor;
+        } catch (NoSuchMethodException ex) {
+            return null;
+        }
+    }
+
+    private static boolean writeHandleInts(Object handle, int... values) {
+        return writeHandlePrimitives(handle, int.class, values, null);
+    }
+
+    private static boolean writeHandleBytes(Object handle, byte... values) {
+        return writeHandlePrimitives(handle, byte.class, null, values);
+    }
+
+    private static boolean writeHandlePrimitives(Object handle, Class<?> primitive, int[] ints, byte[] bytes) {
+        if (handle == null) {
+            return false;
+        }
+        int needed = ints != null ? ints.length : bytes.length;
+        int index = 0;
+        Class<?> cursor = handle.getClass();
+        while (cursor != null && index < needed) {
+            for (Field field : cursor.getDeclaredFields()) {
+                if (index >= needed) {
+                    break;
+                }
+                if (Modifier.isStatic(field.getModifiers()) || field.getType() != primitive) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    if (ints != null) {
+                        field.setInt(handle, ints[index++]);
+                    } else {
+                        field.setByte(handle, bytes[index++]);
+                    }
+                } catch (ReflectiveOperationException ignored) {
+                }
+            }
+            cursor = cursor.getSuperclass();
+        }
+        return index == needed;
     }
 
     private static PacketType resolvePacketType(String name) {
@@ -684,6 +967,15 @@ public final class ActorPacketService {
             } catch (Exception nested) {
                 this.plugin.getLogger().log(Level.FINE, "Packet send failed to " + viewer.getName(), nested);
             }
+        }
+    }
+
+    public void logActionFailure(String action, Throwable ex) {
+        if (!this.warnedAction) {
+            this.warnedAction = true;
+            this.plugin.getLogger().log(Level.WARNING, "Failed applying actor action " + action, ex);
+        } else {
+            this.plugin.getLogger().log(Level.FINE, "Failed applying actor action " + action, ex);
         }
     }
 

@@ -51,8 +51,8 @@ final class ActionApplier {
                 case CHEST, FISHING, VEHICLE -> {
                 }
             }
-        } catch (Throwable ignored) {
-
+        } catch (Throwable ex) {
+            this.packets.logActionFailure(action.type().name(), ex);
         }
     }
 }

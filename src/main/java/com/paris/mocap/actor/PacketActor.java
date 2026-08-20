@@ -14,6 +14,7 @@ public final class PacketActor {
     private final int entityId;
     private final UUID uniqueId;
     private final String name;
+    private final String profileName;
     private final String skinTexture;
     private final String skinSignature;
     private final Set<UUID> viewers = ConcurrentHashMap.newKeySet();
@@ -44,6 +45,7 @@ public final class PacketActor {
         this.entityId = entityId;
         this.uniqueId = uniqueId;
         this.name = name;
+        this.profileName = uniqueProfileName(entityId);
         this.skinTexture = skinTexture;
         this.skinSignature = skinSignature;
         this.pose = spawnPose;
@@ -59,6 +61,24 @@ public final class PacketActor {
 
     public String name() {
         return this.name;
+    }
+
+    /**
+     * GameProfile / scoreboard entry name. Unique so actors do not inherit a real player's
+     * {@code NAME_TAG_VISIBILITY=NEVER} team (teams are keyed by name, not UUID).
+     */
+    public String profileName() {
+        return this.profileName;
+    }
+
+    public String teamName() {
+        String id = "mc" + Integer.toHexString(this.entityId);
+        return id.length() <= 16 ? id : id.substring(0, 16);
+    }
+
+    private static String uniqueProfileName(int entityId) {
+        String name = "m" + Integer.toUnsignedString(entityId, 36);
+        return name.length() <= 16 ? name : name.substring(0, 16);
     }
 
     public String skinTexture() {

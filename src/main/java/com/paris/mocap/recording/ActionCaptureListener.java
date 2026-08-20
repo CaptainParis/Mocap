@@ -46,7 +46,7 @@ public final class ActionCaptureListener implements Listener {
         return this.recordings.settings();
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = false)
     public void onSwing(PlayerAnimationEvent event) {
         if (!settings().recordAnimations() || !this.recordings.isRecording(event.getPlayer())) {
             return;
@@ -254,6 +254,9 @@ public final class ActionCaptureListener implements Listener {
         if (!this.recordings.isRecording(player)) {
             return;
         }
+        if (settings().recordAnimations()) {
+            this.recordings.recordAction(player, ActionData.swing(event.getHand() == EquipmentSlot.OFF_HAND));
+        }
         this.recordings.noteBlockChange(player, event.getBlock().getLocation(), event.getBlockReplacedState().getBlockData());
     }
 
@@ -262,6 +265,9 @@ public final class ActionCaptureListener implements Listener {
         Player player = event.getPlayer();
         if (!this.recordings.isRecording(player)) {
             return;
+        }
+        if (settings().recordAnimations()) {
+            this.recordings.recordAction(player, ActionData.swing(false));
         }
         this.recordings.noteBlockChange(player, event.getBlock().getLocation(), event.getBlock().getBlockData());
     }
