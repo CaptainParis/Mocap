@@ -1,0 +1,47 @@
+# Mocap configuration
+
+storage:
+  directory: recordings
+  async-io: true
+
+playback:
+  view-distance-squared: 9216
+  viewer-refresh-ticks: 20
+  entity-id-base: 1_500_000_000
+
+recording:
+  default-tick-rate: 1
+  default-max-duration-ticks: 0
+  default-radius: 0
+
+world-capture:
+  # OFF | AREA | AUTO_BOX | LOADED_CHUNKS
+  default-mode: LOADED_CHUNKS
+  auto-box-radius: 48
+  chunk-radius: 2
+  # Items, arrows, snowballs and other physics bodies are always sampled every tick.
+  entity-sample-interval: 1
+
+stage:
+  world-name: mocap_stage
+  slot-size: 256
+
+# Per-tick work caps — keep the main thread under 50ms even on large scenes.
+performance:
+  paste-blocks-per-tick: 6144
+  clear-blocks-per-tick: 8192
+  scene-events-per-tick: 384
+  snapshot-chunks-per-tick: 4
+  max-consecutive-faults: 16
+  pose-epsilon: 0.002
+  entity-move-epsilon: 0.02
+
+# Group / match capture profile used by MocapApi.recordGroup(...)
+# World capture OFF still records every block set/removal in the auto-box (no terrain snapshot).
+games:
+  max-players: 500
+  world-capture: OFF
+  max-duration-ticks: 24000
+  notify: false
+  complete-skin: true
+  snapshot-equipment: false

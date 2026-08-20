@@ -1,0 +1,21 @@
+name: Mocap
+version: ${project.version}
+author: 8th
+main: com.paris.mocap.Mocap
+api-version: 1.21
+depend: [ProtocolLib]
+description: Record player motion and world data. Play the recording as packet actors.
+
+commands:
+  mocap:
+    description: Mocap main command
+    usage: /mocap
+    permission: mocap.use
+
+permissions:
+  mocap.use:
+    description: Use Mocap commands and dialogs
+    default: op
+  mocap.admin:
+    description: Delete recordings and change global settings
+    default: op
